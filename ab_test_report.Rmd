@@ -1,0 +1,467 @@
+---
+title: "Did the New Landing Page Really Win?"
+subtitle: "An A/B test analysis in R — separating real lift from random chance"
+author: "Manjiri Gajmal · Freelance Data Scientist"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.2, dpi = 150,
+                      fig.align = "center")
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tidyr)
+
+set.seed(42)
+
+# Consistent look for every chart
+col_A <- "#8A94A6"   # control: neutral slate
+col_B <- "#0F7B8A"   # treatment: teal
+pal   <- c(A = col_A, B = col_B)
+
+theme_ab <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(colour = "grey35"),
+        panel.grid.minor = element_blank(),
+        legend.position = "top",
+        legend.title = element_blank())
+theme_set(theme_ab)
+
+pct  <- function(x, d = 2) percent(x, accuracy = 10^-d)
+fmtp <- function(p) ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+```
+
+```{r load}
+ab <- read.csv("data/ab_test_landing_page.csv", stringsAsFactors = FALSE) %>%
+  mutate(date    = as.Date(date),
+         variant = factor(variant, levels = c("A", "B")),
+         weekend = weekdays(date) %in% c("Saturday", "Sunday"))
+
+summ <- ab %>%
+  group_by(variant) %>%
+  summarise(visitors    = n(),
+            conversions = sum(converted),
+            conv_rate   = mean(converted),
+            revenue     = sum(revenue),
+            rpv         = mean(revenue),
+            .groups = "drop")
+
+pA <- summ$conv_rate[1]; pB <- summ$conv_rate[2]
+nA <- summ$visitors[1];  nB <- summ$visitors[2]
+xA <- summ$conversions[1]; xB <- summ$conversions[2]
+
+ztest <- prop.test(c(xB, xA), c(nB, nA), correct = FALSE)
+abs_diff <- pB - pA
+rel_lift <- pB / pA - 1
+
+# Bootstrap CI for relative lift (computed early so the summary can quote it)
+set.seed(7)
+lift_ci_es <- quantile(replicate(5000,
+  mean(sample(ab$converted[ab$variant == "B"], replace = TRUE)) /
+  mean(sample(ab$converted[ab$variant == "A"], replace = TRUE)) - 1), c(.025, .975))
+```
+
+# Executive summary {-}
+
+<div style="background:#EEF6F7;border-left:5px solid #0F7B8A;padding:14px 18px;border-radius:4px">
+
+**Business question.** An online *Excel: Beginner to Advanced* course tested a redesigned landing page (**B**: testimonials above the fold, a shorter form, a clearer call-to-action) against the current page (**A**) for 28 days, with `r comma(nrow(ab))` visitors split at random.
+
+**Answer.** Version B converted **`r pct(pB)`** of visitors vs **`r pct(pA)`** for A — a **`r pct(rel_lift, 0)` relative lift** (p = `r fmtp(ztest$p.value)`). Five independent checks (z-test, permutation test, Bayesian model, regression with controls, and a data-quality audit) all point the same way: **the lift is very unlikely to be chance.**
+
+**But:** the lift is concentrated on **mobile**, B nudged slightly more buyers to the cheaper plan, and the uplift in **revenue per visitor is real-looking but not yet statistically proven**. The range of plausible effects is wide — from about +`r round(lift_ci_es[1] * 100)`% to +`r round(lift_ci_es[2] * 100)`%.
+
+**Recommendation.** Roll out B on mobile now; keep testing on desktop; track revenue for another cycle before booking the gain in a forecast.
+
+</div>
+
+---
+
+# 1. Experiment design: how big did the test need to be?
+
+Before looking at results, a good analyst asks: *was this test even capable of detecting the effect we care about?* An under-powered test produces noisy "winners" that never replicate.
+
+```{r power}
+baseline <- 0.03     # historical conversion rate of page A
+mde_rel  <- 0.20     # smallest lift worth acting on: +20% relative
+pw <- power.prop.test(p1 = baseline, p2 = baseline * (1 + mde_rel),
+                      sig.level = 0.05, power = 0.80)
+n_needed <- ceiling(pw$n)
+
+data.frame(
+  Assumption = c("Baseline conversion (A)", "Minimum detectable effect",
+                 "Significance level (α)", "Power (1 − β)",
+                 "Visitors needed per variant", "Visitors actually collected per variant"),
+  Value = c(pct(baseline, 1), paste0("+", pct(mde_rel, 0), " relative (",
+                                     pct(baseline, 1), " → ", pct(baseline * 1.2, 1), ")"),
+            "0.05", "80%", comma(n_needed), paste(comma(nA), "/", comma(nB)))
+)
+```
+
+The plan called for **`r comma(n_needed)` visitors per variant**; the test collected **`r comma(min(nA, nB))`+** per variant — `r if (min(nA, nB) >= n_needed) "so it met its power target" else "slightly short of the power target, which widens the uncertainty"`, and the decision date was fixed in advance (28 days). That second point matters a lot; Section 8 shows why.
+
+# 2. Data quality: can we trust the split?
+
+## Sample Ratio Mismatch (SRM) check
+
+If a 50/50 test doesn't deliver roughly 50/50 traffic, something is broken (redirect bugs, bots, tracking failures) and **no downstream result can be trusted**. A chi-square goodness-of-fit test catches this.
+
+```{r srm}
+srm <- chisq.test(c(nA, nB), p = c(0.5, 0.5))
+data.frame(Variant = c("A", "B"), Visitors = comma(c(nA, nB)),
+           Share = pct(c(nA, nB) / (nA + nB), 1),
+           `SRM p-value` = c(fmtp(srm$p.value), ""), check.names = FALSE)
+```
+
+p = `r fmtp(srm$p.value)` (well above the usual 0.01 alarm threshold) → **no sample ratio mismatch**. Traffic was split as designed.
+
+## Daily traffic & mix balance
+
+```{r traffic, fig.height=3.6}
+ab %>% count(date, variant) %>%
+  ggplot(aes(date, n, colour = variant)) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.4) +
+  scale_colour_manual(values = pal, labels = c("A (control)", "B (new page)")) +
+  labs(title = "Daily visitors per variant",
+       subtitle = "Both arms track each other closely, including weekend dips",
+       x = NULL, y = "Visitors")
+```
+
+```{r balance}
+bal <- ab %>%
+  pivot_longer(c(device, source), names_to = "dimension", values_to = "level") %>%
+  count(dimension, level, variant) %>%
+  group_by(dimension, variant) %>% mutate(share = n / sum(n)) %>% ungroup() %>%
+  select(-n) %>% pivot_wider(names_from = variant, values_from = share) %>%
+  mutate(Difference = A - B)
+
+bal %>% mutate(across(c(A, B), ~ pct(.x, 1)),
+               Difference = paste0(round(Difference * 100, 1), " pp")) %>%
+  rename(Dimension = dimension, Level = level, `Share in A` = A, `Share in B` = B)
+```
+
+Device and channel mix differ by well under one percentage point between arms — randomisation did its job, so differences in outcomes can be attributed to the page itself.
+
+# 3. Primary metric: conversion rate
+
+```{r conv_table}
+summ %>%
+  transmute(Variant = c("A (control)", "B (new page)"),
+            Visitors = comma(visitors), Enrolments = comma(conversions),
+            `Conversion rate` = pct(conv_rate))
+```
+
+```{r conv_plot, fig.height=3.4}
+ci <- summ %>% rowwise() %>%
+  mutate(lo = prop.test(conversions, visitors)$conf.int[1],
+         hi = prop.test(conversions, visitors)$conf.int[2]) %>% ungroup()
+
+ggplot(ci, aes(conv_rate, variant, colour = variant)) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.15, linewidth = 1) +
+  geom_point(size = 4) +
+  geom_text(aes(label = pct(conv_rate)), vjust = -1.3, size = 4, show.legend = FALSE) +
+  scale_colour_manual(values = pal) +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title = "Conversion rate with 95% confidence intervals",
+       subtitle = "Intervals overlap slightly — which is why we need a proper test, not eyeballing",
+       x = "Conversion rate", y = NULL) +
+  theme(legend.position = "none")
+```
+
+## Two-proportion z-test
+
+```{r ztest}
+# Confidence interval for the relative lift via bootstrap (lift is a ratio,
+# so the z-test's interval for the difference doesn't apply directly).
+# Computed in the setup chunk: 5,000 resamples of each arm.
+lift_ci <- unname(lift_ci_es)
+
+data.frame(
+  Measure = c("Absolute difference (B − A)", "95% CI for absolute difference",
+              "Relative lift", "95% CI for relative lift (bootstrap)",
+              "z-test p-value"),
+  Value = c(paste0("+", round(abs_diff * 100, 2), " pp"),
+            paste0("[", round(ztest$conf.int[1] * 100, 2), " pp, ",
+                   round(ztest$conf.int[2] * 100, 2), " pp]"),
+            paste0("+", pct(rel_lift, 1)),
+            paste0("[", pct(lift_ci[1], 1), ", ", pct(lift_ci[2], 1), "]"),
+            fmtp(ztest$p.value))
+)
+```
+
+**Reading this like a stakeholder:** if the two pages were truly identical, a gap this large would show up only about `r round(ztest$p.value * 100, 1)`% of the time. The confidence interval excludes zero, but it is **wide** — the true lift could plausibly be anywhere from about `r pct(lift_ci[1], 0)` to `r pct(lift_ci[2], 0)`. That width is the honest part of the story, and it shapes the recommendation.
+
+# 4. "Was it just chance?" — two independent answers
+
+A single p-value is easy to over-trust. Here are two different ways of asking the same question that don't rely on the z-test's assumptions.
+
+## 4a. Permutation test: shuffle the labels 10,000 times
+
+If the page made no difference, then the "A" and "B" labels are meaningless — so we can shuffle them at random and see how often chance alone produces a gap as big as the one we observed.
+
+```{r permutation}
+n_perm <- 10000
+conv   <- ab$converted
+is_B   <- ab$variant == "B"
+obs    <- mean(conv[is_B]) - mean(conv[!is_B])
+
+perm_diffs <- replicate(n_perm, {
+  s <- sample(is_B)
+  mean(conv[s]) - mean(conv[!s])
+})
+perm_p <- mean(abs(perm_diffs) >= abs(obs))
+
+ggplot(data.frame(d = perm_diffs), aes(d)) +
+  geom_histogram(bins = 35, fill = col_A, alpha = 0.75, colour = "white") +
+  geom_vline(xintercept = obs, colour = col_B, linewidth = 1.2) +
+  annotate("label", x = obs, y = Inf, vjust = 1.2, hjust = 1.05,
+           label = paste0("Observed gap: +", round(obs * 100, 2), " pp"),
+           colour = col_B, fill = "white", label.size = 0) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_x_continuous(labels = function(x) paste0(round(x * 100, 1), " pp")) +
+  labs(title = "What 'pure chance' looks like (10,000 shuffles)",
+       subtitle = paste0("Only ", pct(perm_p, 1),
+                         " of random shuffles produced a gap this large (either direction)"),
+       x = "Difference in conversion rate (B − A) under no real effect", y = "Count")
+```
+
+Permutation p-value: **`r fmtp(perm_p)`** — closely agreeing with the z-test, with no distributional assumptions at all.
+
+## 4b. Bayesian view: what's the probability B is actually better?
+
+Business stakeholders rarely want a p-value — they want *"how sure are we B is better, and how much could we lose if we're wrong?"* A Beta-Binomial model answers that directly.
+
+```{r bayes}
+draws <- 100000
+post_A <- rbeta(draws, 1 + xA, 1 + nA - xA)   # uniform Beta(1,1) prior
+post_B <- rbeta(draws, 1 + xB, 1 + nB - xB)
+
+prob_B_better <- mean(post_B > post_A)
+post_lift     <- post_B / post_A - 1
+prob_10       <- mean(post_lift > 0.10)
+exp_loss_B    <- mean(pmax(post_A - post_B, 0))  # expected conversion loss if we ship B
+
+data.frame(
+  Question = c("Probability B beats A", "Probability lift exceeds +10%",
+               "95% credible interval for lift",
+               "Expected loss if we ship B and we're wrong"),
+  Answer = c(pct(prob_B_better, 1), pct(prob_10, 1),
+             paste0("[", pct(quantile(post_lift, .025), 1), ", ",
+                    pct(quantile(post_lift, .975), 1), "]"),
+             paste0(signif(exp_loss_B * 100, 2), " pp of conversion (tiny)"))
+)
+```
+
+```{r bayes_plot, fig.height=3.6}
+data.frame(rate = c(post_A, post_B),
+           variant = rep(c("A", "B"), each = draws)) %>%
+  ggplot(aes(rate, fill = variant)) +
+  geom_density(alpha = 0.6, colour = NA) +
+  scale_fill_manual(values = pal, labels = c("A (control)", "B (new page)")) +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title = "Where each page's true conversion rate probably lies",
+       subtitle = paste0("P(B > A) = ", pct(prob_B_better, 1)),
+       x = "True conversion rate", y = "Posterior density")
+```
+
+There is a **`r pct(prob_B_better, 0)` probability B is genuinely better**, and the downside risk of shipping it is negligible. That's a decision a manager can act on.
+
+# 5. Secondary metric: revenue per visitor
+
+Conversions only matter if they turn into money. Revenue per visitor (RPV) is harder to test because it's extremely skewed: ~97% of visitors spend $0, and buyers pay either $49 (Standard) or $129 (Pro bundle).
+
+```{r revenue}
+rev_A <- ab$revenue[ab$variant == "A"]
+rev_B <- ab$revenue[ab$variant == "B"]
+welch <- t.test(rev_B, rev_A)
+
+boot_rpv <- replicate(5000, mean(sample(rev_B, replace = TRUE)) -
+                            mean(sample(rev_A, replace = TRUE)))
+rpv_ci <- quantile(boot_rpv, c(0.025, 0.975))
+
+pro_mix <- ab %>% filter(converted == 1) %>% group_by(variant) %>%
+  summarise(pro_share = mean(revenue == 129), aov = mean(revenue), .groups = "drop")
+
+data.frame(
+  Measure = c("Revenue per visitor — A", "Revenue per visitor — B",
+              "Difference (B − A)", "95% CI (bootstrap)", "Welch t-test p-value",
+              "Avg. order value — A / B", "Pro bundle share of buyers — A / B"),
+  Value = c(dollar(mean(rev_A), 0.01), dollar(mean(rev_B), 0.01),
+            dollar(mean(rev_B) - mean(rev_A), 0.01),
+            paste0("[", dollar(rpv_ci[1], 0.01), ", ", dollar(rpv_ci[2], 0.01), "]"),
+            fmtp(welch$p.value),
+            paste(dollar(pro_mix$aov, 0.01), collapse = " / "),
+            paste(pct(pro_mix$pro_share, 1), collapse = " / "))
+)
+```
+
+**Insight:** B wins more buyers, but a smaller share of them choose the Pro bundle (`r pct(pro_mix$pro_share[2], 0)` vs `r pct(pro_mix$pro_share[1], 0)`), so the average order is lower. The net RPV gain is positive but its confidence interval **includes zero** (p = `r fmtp(welch$p.value)`). In plain words: *B very likely brings in more students; whether it brings in more money is not yet proven.* This is a common trap — declaring a revenue win off a conversion win.
+
+# 6. Robustness: does the effect survive controls?
+
+Randomisation should make controls unnecessary, but a logistic regression that adjusts for device, traffic source, new vs returning visitors and weekends is a useful sanity check — and it usually tightens the estimate.
+
+```{r logit}
+m <- glm(converted ~ variant + device + source + new_visitor + weekend,
+         data = ab, family = binomial)
+
+co <- summary(m)$coefficients
+ci_m <- confint.default(m)
+data.frame(Term = rownames(co),
+           `Odds ratio` = round(exp(co[, 1]), 3),
+           `95% CI` = paste0("[", round(exp(ci_m[, 1]), 2), ", ", round(exp(ci_m[, 2]), 2), "]"),
+           `p-value` = fmtp(co[, 4]), check.names = FALSE, row.names = NULL) %>%
+  mutate(Term = recode(Term, "(Intercept)" = "Intercept", "variantB" = "Version B",
+                       "deviceMobile" = "Mobile (vs Desktop)", "deviceTablet" = "Tablet (vs Desktop)",
+                       "sourceOrganic search" = "Organic search (vs Email)",
+                       "sourcePaid social" = "Paid social (vs Email)",
+                       "sourceReferral" = "Referral (vs Email)",
+                       "new_visitor" = "New visitor", "weekendTRUE" = "Weekend"))
+```
+
+After controlling for everything else, **Version B raises the odds of enrolment by about `r pct(exp(coef(m)["variantB"]) - 1, 0)`** (p = `r fmtp(co["variantB", 4])`). The effect is stable, not an artefact of traffic mix. The model also surfaces useful side-insights: email traffic converts best and paid social worst — worth a separate conversation about ad spend.
+
+# 7. Segments: where does B actually help?
+
+```{r segments}
+seg <- ab %>% group_by(device) %>%
+  summarise(nA = sum(variant == "A"), nB = sum(variant == "B"),
+            xA = sum(converted[variant == "A"]), xB = sum(converted[variant == "B"]),
+            .groups = "drop") %>%
+  rowwise() %>%
+  mutate(rateA = xA / nA, rateB = xB / nB, lift = rateB / rateA - 1,
+         p_raw = prop.test(c(xB, xA), c(nB, nA), correct = FALSE)$p.value,
+         lo = prop.test(c(xB, xA), c(nB, nA), correct = FALSE)$conf.int[1],
+         hi = prop.test(c(xB, xA), c(nB, nA), correct = FALSE)$conf.int[2]) %>%
+  ungroup() %>%
+  mutate(p_holm = p.adjust(p_raw, method = "holm"))
+
+seg %>% transmute(Device = device, `Visitors (A / B)` = paste(comma(nA), "/", comma(nB)),
+                  `Conv. A` = pct(rateA), `Conv. B` = pct(rateB),
+                  `Relative lift` = pct(lift, 0),
+                  `p (raw)` = fmtp(p_raw), `p (Holm-adjusted)` = fmtp(p_holm))
+```
+
+```{r seg_plot, fig.height=3.4}
+ggplot(seg, aes(x = (rateB - rateA), y = reorder(device, nA + nB))) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.15, colour = col_B, linewidth = 1) +
+  geom_point(size = 3.5, colour = col_B) +
+  scale_x_continuous(labels = function(x) paste0(round(x * 100, 1), " pp")) +
+  labs(title = "Lift by device (B − A, with 95% CI)",
+       subtitle = "Mobile drives the win; desktop is flat; tablet sample is too small to judge",
+       x = "Difference in conversion rate", y = NULL)
+
+int_test <- anova(glm(converted ~ variant + device, data = ab, family = binomial),
+                  glm(converted ~ variant * device, data = ab, family = binomial),
+                  test = "Chisq")
+```
+
+- **Mobile** shows a `r pct(seg$lift[seg$device == "Mobile"], 0)` lift that survives correction for testing multiple segments (Holm-adjusted p = `r fmtp(seg$p_holm[seg$device == "Mobile"])`) — consistent with B's shorter form being easier on a phone.
+- **Desktop** shows essentially no change (`r pct(seg$lift[seg$device == "Desktop"], 0)`).
+- **Tablet** rests on only ~`r comma(round(seg$nA[seg$device == "Tablet"], -2))` visitors per arm — the interval is huge, so it's not evidence of anything either way.
+- A formal interaction test (does the effect differ by device?) gives p = `r fmtp(int_test[2, "Pr(>Chi)"])`, so this pattern is **suggestive, not conclusive** — the right move is a follow-up test, not a victory lap.
+
+> **Why the correction matters:** slice a test into enough segments and *something* will look significant by chance. Adjusting p-values for the number of comparisons is what separates analysis from data-dredging.
+
+# 8. The peeking trap: why the decision date was fixed
+
+A very common mistake is checking results every day and stopping the moment p < 0.05. Here is the day-by-day p-value for this test:
+
+```{r peeking, fig.height=3.6}
+daily <- ab %>% arrange(date) %>% group_by(date, variant) %>%
+  summarise(n = n(), x = sum(converted), .groups = "drop") %>%
+  pivot_wider(names_from = variant, values_from = c(n, x)) %>%
+  mutate(across(c(n_A, n_B, x_A, x_B), cumsum),
+         day = row_number())
+daily$p <- mapply(function(xa, na, xb, nb) prop.test(c(xb, xa), c(nb, na), correct = FALSE)$p.value,
+                  daily$x_A, daily$n_A, daily$x_B, daily$n_B)
+
+ggplot(daily, aes(day, p)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 0.05, fill = col_B, alpha = 0.08) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = col_B) +
+  geom_line(colour = "grey30", linewidth = 0.9) + geom_point(size = 1.6, colour = "grey30") +
+  scale_y_continuous(trans = "log10", breaks = c(0.01, 0.05, 0.1, 0.25, 0.5, 1)) +
+  labs(title = "Cumulative p-value, day by day",
+       subtitle = "The p-value wanders — stopping on a 'lucky' day inflates false wins",
+       x = "Day of test", y = "p-value (log scale)")
+```
+
+To show how dangerous this is, I simulated **2,000 A/A tests** — tests where *both* pages are identical, so every "winner" is a false alarm — and compared two analysts:
+
+```{r aa_sim}
+n_sims <- 2000; days <- 28; per_day <- 450; p0 <- 0.03
+fixed_fp <- peek_fp <- logical(n_sims)
+for (s in seq_len(n_sims)) {
+  xa <- cumsum(rbinom(days, per_day, p0)); xb <- cumsum(rbinom(days, per_day, p0))
+  n  <- per_day * seq_len(days)
+  pooled <- (xa + xb) / (2 * n)
+  z  <- (xb / n - xa / n) / sqrt(pooled * (1 - pooled) * 2 / n)
+  pv <- 2 * pnorm(-abs(z))
+  fixed_fp[s] <- pv[days] < 0.05          # analyst checks once, on day 28
+  peek_fp[s]  <- any(pv[3:days] < 0.05)   # analyst checks daily, stops at first p < 0.05
+}
+
+data.frame(Analyst = c("Disciplined: analyses once at the planned end",
+                       "Impatient: peeks daily, stops at first p < 0.05"),
+           `False 'winners' declared` = pct(c(mean(fixed_fp), mean(peek_fp)), 1),
+           check.names = FALSE)
+```
+
+Same data-generating process, same 5% threshold — but daily peeking **multiplies the false-positive rate by about `r round(mean(peek_fp) / mean(fixed_fp))`×**. That is why this test had a pre-registered sample size and end date, and why the result above can be trusted. (If a business genuinely needs to monitor continuously, the fix is a sequential design such as alpha-spending or a Bayesian decision rule — not ad-hoc peeking.)
+
+# 9. Business impact
+
+```{r impact}
+monthly_visitors <- round(nrow(ab) / 28 * 30)
+extra_lo  <- monthly_visitors * pA * lift_ci[1]
+extra_mid <- monthly_visitors * pA * rel_lift
+extra_hi  <- monthly_visitors * pA * lift_ci[2]
+# Revenue impact uses revenue-per-visitor, NOT extra enrolments x order value:
+# B also lowers spend among buyers who would have bought anyway, and only RPV
+# captures both effects at once.
+rpv_diff <- mean(rev_B) - mean(rev_A)
+rev_lo  <- monthly_visitors * rpv_ci[1]
+rev_mid <- monthly_visitors * rpv_diff
+rev_hi  <- monthly_visitors * rpv_ci[2]
+
+data.frame(Scenario = c("Conservative (low end of 95% CI)", "Most likely (point estimate)",
+                        "Optimistic (high end of 95% CI)"),
+           `Extra enrolments / month` = round(c(extra_lo, extra_mid, extra_hi)),
+           `Revenue change / month*` = dollar(round(unname(c(rev_lo, rev_mid, rev_hi)))),
+           check.names = FALSE)
+```
+
+<small>*Based on ~`r comma(monthly_visitors)` visitors/month and the revenue-per-visitor confidence interval from Section 5.</small>
+
+The two columns tell different stories, and that's the point. Enrolments rise in every scenario (roughly `r round(extra_lo)` to `r round(extra_hi)` more students a month). Revenue could rise by up to `r dollar(round(rev_hi))` a month — or **fall** by up to `r dollar(round(abs(rev_lo)))` if B's downgrade effect on the Pro bundle dominates. That uncertainty is exactly why the recommendation below fixes the upsell before booking any revenue gain.
+
+# 10. Recommendation & limitations
+
+**Decision**
+
+1. **Ship Version B to mobile traffic now.** The lift there is large, survives multiple-comparison correction, and the risk of hurting conversion is negligible.
+2. **Keep A vs B running on desktop** — there's no evidence B helps there, and no reason to change what works.
+3. **Fix the upsell on B.** Add the Pro bundle's benefits to the redesigned page, then re-test with revenue per visitor as the primary metric.
+
+**Limitations**
+
+- 28 days captures four weekly cycles but not seasonality (e.g., exam periods, new-year resolutions).
+- Novelty effect: a fresh design can over-perform briefly; monitor the post-launch conversion rate for decay.
+- Revenue is measured at purchase only — refunds and course completion (the real value drivers) aren't in the data.
+- The dataset is synthetic, built to mirror real-world traffic patterns, so the methodology can be shared publicly.
+
+---
+
+<small>Methods used: power analysis · sample-ratio-mismatch test · two-proportion z-test · bootstrap confidence intervals · permutation test · Bayesian Beta-Binomial model · Welch t-test · logistic regression · Holm multiple-comparison correction · interaction test · Monte-Carlo simulation of A/A tests. Built with R (`dplyr`, `ggplot2`, `rmarkdown`).</small>
